@@ -69,17 +69,18 @@ jobs:
 
           Copy-Item .mwgc-ci/0611/UnicodePathRegression.cpp mwgc-src/UnicodePathRegression.cpp
           $cmake = Get-Content -Raw mwgc-src/CMakeLists.txt
-          $testTarget = @'
-
-add_executable(MWGroundcoverUnicodePathTest
-        UnicodePathRegression.cpp
-        src/logic/SolidAssets.cpp
-        src/logic/SolidGeometry.cpp
-        src/logic/GameConfiguration.cpp)
-target_compile_features(MWGroundcoverUnicodePathTest PRIVATE cxx_std_20)
-target_link_libraries(MWGroundcoverUnicodePathTest spdlog::spdlog_header_only)
-'@
-          $cmake += $testTarget
+          $testLines = @(
+            "",
+            "add_executable(MWGroundcoverUnicodePathTest",
+            "        UnicodePathRegression.cpp",
+            "        src/logic/SolidAssets.cpp",
+            "        src/logic/SolidGeometry.cpp",
+            "        src/logic/GameConfiguration.cpp)",
+            "target_compile_features(MWGroundcoverUnicodePathTest PRIVATE cxx_std_20)",
+            "target_link_libraries(MWGroundcoverUnicodePathTest spdlog::spdlog_header_only)",
+            ""
+          )
+          $cmake += ($testLines -join [Environment]::NewLine)
           [IO.File]::WriteAllText((Join-Path $PWD "mwgc-src/CMakeLists.txt"), $cmake)
 
           $cmakeCheck = Get-Content -Raw mwgc-src/CMakeLists.txt
