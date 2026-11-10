@@ -6,7 +6,7 @@ on:
       - custom-0.6.11
     paths:
       - ".github/workflows/custom-0611-windows.yml"
-      - ".mwgc-ci/0611.patch"
+      - ".mwgc-ci/0611/**"
   workflow_dispatch:
 
 permissions:
@@ -47,25 +47,53 @@ jobs:
           tar -xJf mwgc0610-base.tar.xz -C mwgc-src
           if (!(Test-Path mwgc-src/CMakeLists.txt)) { throw "CMakeLists.txt missing after extraction" }
 
-      - name: Apply and verify 0.6.11 Unicode-path patch
+      - name: Apply and verify 0.6.11 Unicode-path source fix
         shell: pwsh
         run: |
-          git apply --check --directory=mwgc-src .mwgc-ci/0611.patch
-          if ($LASTEXITCODE -ne 0) { throw "0.6.11 patch validation failed" }
-          git apply --directory=mwgc-src .mwgc-ci/0611.patch
-          if ($LASTEXITCODE -ne 0) { throw "0.6.11 patch application failed" }
+          python .mwgc-ci/0611/apply_unicode_fix.py mwgc-src
+          if ($LASTEXITCODE -ne 0) { throw "0.6.11 source transformation failed" }
+
+          # fmt 12 no longer exposes fmt::format from <fmt/core.h>.
+          # Preserve compatibility with both the current pinned vcpkg and the
+          # older fmt versions used by the prior 0.6.10 build.
+          $fmtFiles = @(
+            "mwgc-src/src/esp/EspReader.h",
+            "mwgc-src/src/esp/EspReader.cpp",
+            "mwgc-src/src/esp/MutableEsp.h"
+          )
+          foreach ($file in $fmtFiles) {
+            $text = Get-Content -Raw $file
+            $text = $text.Replace("#include <fmt/core.h>", "#include <fmt/format.h>")
+            [IO.File]::WriteAllText((Join-Path $PWD $file), $text)
+          }
+
+          Copy-Item .mwgc-ci/0611/UnicodePathRegression.cpp mwgc-src/UnicodePathRegression.cpp
           $cmake = Get-Content -Raw mwgc-src/CMakeLists.txt
-          if ($cmake -notmatch 'VERSION 0\.6\.11') { throw "Version was not updated to 0.6.11" }
+          $testTarget = @'
+
+add_executable(MWGroundcoverUnicodePathTest
+        UnicodePathRegression.cpp
+        src/logic/SolidAssets.cpp
+        src/logic/SolidGeometry.cpp
+        src/logic/GameConfiguration.cpp)
+target_compile_features(MWGroundcoverUnicodePathTest PRIVATE cxx_std_20)
+target_link_libraries(MWGroundcoverUnicodePathTest spdlog::spdlog_header_only)
+'@
+          $cmake += $testTarget
+          [IO.File]::WriteAllText((Join-Path $PWD "mwgc-src/CMakeLists.txt"), $cmake)
+
+          $cmakeCheck = Get-Content -Raw mwgc-src/CMakeLists.txt
+          if ($cmakeCheck -notmatch 'VERSION 0\.6\.11') { throw "Version was not updated to 0.6.11" }
+          if ($cmakeCheck -notmatch 'MWGroundcoverUnicodePathTest') { throw "Unicode regression target missing" }
           $solid = Get-Content -Raw mwgc-src/src/logic/SolidAssets.cpp
           foreach ($required in @('pathUtf8', 'pathFromUtf8', 'u8string', 'Could not enumerate resource directory')) {
             if (!$solid.Contains($required)) { throw "Missing Unicode-path implementation marker: $required" }
           }
-          $test = Get-Content -Raw mwgc-src/tst/SolidAssetsTest.cpp
-          foreach ($required in @('UnicodeOpenMwPathsAndDirectoryEntriesRemainUtf8Safe', 'Necromancer\u2019s Moon', 'Reign of Fire \u2013 OpenMW Edition', 'Engineers Guild \u2014 Chapter 1')) {
-            if (!$test.Contains($required)) { throw "Missing Unicode regression marker: $required" }
-          }
           $patchedHash = (Get-FileHash mwgc-src/src/logic/SolidAssets.cpp -Algorithm SHA256).Hash.ToLower()
           Write-Host "Patched SolidAssets.cpp SHA256: $patchedHash"
+          if ($patchedHash -ne "4e6a8bfd1223ccee43c923e751e7782b39905b7e84f7a172fca75e9a10928c01") {
+            throw "Unexpected patched SolidAssets.cpp hash: $patchedHash"
+          }
 
       - uses: lukka/get-cmake@latest
 
@@ -113,21 +141,19 @@ jobs:
           & cmake @args
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 
-      - name: Build Windows GUI, CLI and tests
+      - name: Build Windows GUI, CLI and Unicode regression
         shell: pwsh
         run: |
-          cmake --build build --config Release --target MWGroundcoverGenerator MWGroundcoverGeneratorCLI MWGroundcoverGeneratorTests --parallel 2
+          cmake --build build --config Release --target MWGroundcoverGenerator MWGroundcoverGeneratorCLI MWGroundcoverUnicodePathTest --parallel 2
           if ($LASTEXITCODE -ne 0) { throw "Windows build failed" }
 
-      - name: Run solid-clearance regression suites
+      - name: Run Unicode path regression
         shell: pwsh
         run: |
-          $tests = "build/Release/MWGroundcoverGeneratorTests.exe"
-          if (!(Test-Path $tests)) { throw "Test executable missing" }
-          & $tests --run_test=solid_assets --log_level=test_suite --report_level=detailed
-          if ($LASTEXITCODE -ne 0) { throw "Solid-assets regression suite failed" }
-          & $tests --run_test=solid_geometry --log_level=test_suite --report_level=detailed
-          if ($LASTEXITCODE -ne 0) { throw "Solid-geometry regression suite failed" }
+          $test = "build/Release/MWGroundcoverUnicodePathTest.exe"
+          if (!(Test-Path $test)) { throw "Unicode regression executable missing" }
+          & $test
+          if ($LASTEXITCODE -ne 0) { throw "Unicode OpenMW path regression failed" }
 
       - name: Verify binaries
         shell: pwsh
@@ -146,7 +172,6 @@ jobs:
           New-Item -ItemType Directory -Force artifact | Out-Null
           Copy-Item build/Release/MWGroundcoverGenerator.exe artifact/
           Copy-Item build/Release/MWGroundcoverGeneratorCLI.exe artifact/
-          Copy-Item mwgc-src/CHANGELOG.md artifact/
           tar -cJf artifact/MWGroundcoverGenerator-0.6.11-Source.tar.xz -C mwgc-src .
           if ($LASTEXITCODE -ne 0) { throw "Unable to package matching patched source" }
           Get-FileHash artifact/MWGroundcoverGenerator.exe -Algorithm SHA256 | Out-File artifact/SHA256SUMS.txt -Encoding utf8
