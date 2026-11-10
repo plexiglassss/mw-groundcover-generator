@@ -49,7 +49,7 @@ jobs:
           # Keep the source archive pristine; only omit tests from this build copy.
           $cmake = Get-Content -Raw mwgc-src/CMakeLists.txt
           $cmake = $cmake.Replace("add_subdirectory(tst)", "")
-          Set-Content -NoNewline mwgc-src/CMakeLists.txt $cmake
+          [IO.File]::WriteAllText((Join-Path $PWD "mwgc-src/CMakeLists.txt"), $cmake)
 
       - name: Configure
         shell: pwsh
