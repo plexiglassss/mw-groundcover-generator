@@ -20,32 +20,36 @@ jobs:
       - name: Reconstruct exact 0.6.10 source
         shell: pwsh
         run: |
-          $parts = @(
-            @{ url = "https://raw.githubusercontent.com/plexiglassss/openmw/383928b7bcf0a7f158a88149f487606288800bad/mwgc0610-core.part00"; out = "p00" },
-            @{ url = "https://raw.githubusercontent.com/plexiglassss/openmw/eee7e18a2e437e0b93410ac50032b458c75c418e/mwgc0610-core.part01_02"; out = "p01_02" },
-            @{ url = "https://raw.githubusercontent.com/plexiglassss/openmw/285c970fd2976df274a4bcb371aef1143f80b3b3/mwgc0610-core.part03_04"; out = "p03_04" },
-            @{ url = "https://raw.githubusercontent.com/plexiglassss/openmw/764a2f0d697a55c8b3be1b831d68c4b78f8f3b0a/mwgc0610-core.part05_06"; out = "p05_06" },
-            @{ url = "https://raw.githubusercontent.com/plexiglassss/openmw/7f148e3100755f075a443321da0de35c772a75dd/mwgc0610-core.part07_08"; out = "p07_08" },
-            @{ url = "https://raw.githubusercontent.com/plexiglassss/openmw/902618a5dad7baccf935fedb8f4bcdf21335b821/mwgc0610-core.part09_10"; out = "p09_10" }
+          $names = @(
+            ".mwgc-ci/source.part00",
+            ".mwgc-ci/source.part01a",
+            ".mwgc-ci/source.part02",
+            ".mwgc-ci/source.part03a",
+            ".mwgc-ci/source.part03b",
+            ".mwgc-ci/source.part04",
+            ".mwgc-ci/source.part05",
+            ".mwgc-ci/source.part06"
           )
-          foreach ($p in $parts) {
-            curl.exe -L --fail --retry 5 --retry-delay 2 $p.url -o $p.out
-            if ($LASTEXITCODE -ne 0) { throw "Failed downloading $($p.url)" }
-          }
           $b64 = ""
-          foreach ($name in @("p00","p01_02","p03_04","p05_06","p07_08","p09_10")) {
+          foreach ($name in $names) {
+            if (!(Test-Path $name)) { throw "Missing source block: $name" }
             $b64 += (Get-Content -Raw $name).Trim()
           }
-          [IO.File]::WriteAllBytes("mwgc0610-core.tar.xz", [Convert]::FromBase64String($b64))
-          $hash = (Get-FileHash "mwgc0610-core.tar.xz" -Algorithm SHA256).Hash.ToLower()
+          if ($b64.Length -ne 103196) { throw "Unexpected Base64 length: $($b64.Length)" }
+          [IO.File]::WriteAllBytes("mwgc0610-minsrc9.tar.xz", [Convert]::FromBase64String($b64))
+          $hash = (Get-FileHash "mwgc0610-minsrc9.tar.xz" -Algorithm SHA256).Hash.ToLower()
           Write-Host "Source SHA256: $hash"
-          if ($hash -ne "052e46c799ca93165ec9b36ce2726ca9d907e43b77325e677cc7421476783f5c") {
+          if ($hash -ne "f5466130cb51d91495e8f3a47342f2c3968d7e913155ec0746a1d4b6f13e4dfb") {
             throw "Source SHA256 mismatch: $hash"
           }
           New-Item -ItemType Directory -Force mwgc-src | Out-Null
-          tar -xJf mwgc0610-core.tar.xz -C mwgc-src
+          tar -xJf mwgc0610-minsrc9.tar.xz -C mwgc-src
           if (!(Test-Path mwgc-src/CMakeLists.txt)) { throw "CMakeLists.txt missing after extraction" }
-          (Get-Content -Raw mwgc-src/CMakeLists.txt).Replace("add_subdirectory(tst)", "") | Set-Content -NoNewline mwgc-src/CMakeLists.txt
+
+          # Keep the source archive pristine; only omit tests from this build copy.
+          $cmake = Get-Content -Raw mwgc-src/CMakeLists.txt
+          $cmake = $cmake.Replace("add_subdirectory(tst)", "")
+          Set-Content -NoNewline mwgc-src/CMakeLists.txt $cmake
 
       - name: Configure
         shell: pwsh
@@ -73,18 +77,10 @@ jobs:
           New-Item -ItemType Directory -Force artifact | Out-Null
           Copy-Item build/MWGroundcoverGenerator.exe artifact/
           Copy-Item build/MWGroundcoverGeneratorCLI.exe artifact/
-          Copy-Item mwgc-src/vcpkg.json artifact/
-          Copy-Item mwgc-src/CMakeLists.txt artifact/
-          Compress-Archive -Path mwgc-src/* -DestinationPath MWGroundcoverGenerator-0.6.10-Source.zip -Force
+          Copy-Item mwgc0610-minsrc9.tar.xz artifact/MWGroundcoverGenerator-0.6.10-Source.tar.xz
 
       - uses: actions/upload-artifact@v4
         with:
           name: MWGroundcoverGenerator-0.6.10-Windows-x64
           path: artifact
-          if-no-files-found: error
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: MWGroundcoverGenerator-0.6.10-Source
-          path: MWGroundcoverGenerator-0.6.10-Source.zip
           if-no-files-found: error
