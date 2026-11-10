@@ -62,6 +62,8 @@ jobs:
 
       - name: Configure
         shell: pwsh
+        env:
+          VCPKG_BINARY_SOURCES: clear
         run: |
           $toolchain = Join-Path "${{ steps.vcpkg.outputs.RUNVCPKG_VCPKG_ROOT_OUT }}" "scripts/buildsystems/vcpkg.cmake"
           $args = @(
