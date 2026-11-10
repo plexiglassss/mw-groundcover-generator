@@ -1,0 +1,160 @@
+name: Custom 0.6.11 Windows build
+
+on:
+  push:
+    branches:
+      - custom-0.6.11
+    paths:
+      - ".github/workflows/custom-0611-windows.yml"
+      - ".mwgc-ci/0611.patch"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct exact 0.6.10 base source
+        shell: pwsh
+        run: |
+          $names = @(
+            ".mwgc-ci/source.part00",
+            ".mwgc-ci/source.part01a",
+            ".mwgc-ci/source.part02",
+            ".mwgc-ci/source.part03a",
+            ".mwgc-ci/source.part03b",
+            ".mwgc-ci/source.part04",
+            ".mwgc-ci/source.part05",
+            ".mwgc-ci/source.part06"
+          )
+          $b64 = ""
+          foreach ($name in $names) {
+            if (!(Test-Path $name)) { throw "Missing source block: $name" }
+            $b64 += (Get-Content -Raw $name).Trim()
+          }
+          if ($b64.Length -ne 103196) { throw "Unexpected Base64 length: $($b64.Length)" }
+          [IO.File]::WriteAllBytes("mwgc0610-base.tar.xz", [Convert]::FromBase64String($b64))
+          $hash = (Get-FileHash "mwgc0610-base.tar.xz" -Algorithm SHA256).Hash.ToLower()
+          Write-Host "Base source SHA256: $hash"
+          if ($hash -ne "f5466130cb51d91495e8f3a47342f2c3968d7e913155ec0746a1d4b6f13e4dfb") {
+            throw "Base source SHA256 mismatch: $hash"
+          }
+          New-Item -ItemType Directory -Force mwgc-src | Out-Null
+          tar -xJf mwgc0610-base.tar.xz -C mwgc-src
+          if (!(Test-Path mwgc-src/CMakeLists.txt)) { throw "CMakeLists.txt missing after extraction" }
+
+      - name: Apply and verify 0.6.11 Unicode-path patch
+        shell: pwsh
+        run: |
+          git apply --check --directory=mwgc-src .mwgc-ci/0611.patch
+          if ($LASTEXITCODE -ne 0) { throw "0.6.11 patch validation failed" }
+          git apply --directory=mwgc-src .mwgc-ci/0611.patch
+          if ($LASTEXITCODE -ne 0) { throw "0.6.11 patch application failed" }
+          $cmake = Get-Content -Raw mwgc-src/CMakeLists.txt
+          if ($cmake -notmatch 'VERSION 0\.6\.11') { throw "Version was not updated to 0.6.11" }
+          $solid = Get-Content -Raw mwgc-src/src/logic/SolidAssets.cpp
+          foreach ($required in @('pathUtf8', 'pathFromUtf8', 'u8string', 'Could not enumerate resource directory')) {
+            if (!$solid.Contains($required)) { throw "Missing Unicode-path implementation marker: $required" }
+          }
+          $test = Get-Content -Raw mwgc-src/tst/SolidAssetsTest.cpp
+          foreach ($required in @('UnicodeOpenMwPathsAndDirectoryEntriesRemainUtf8Safe', 'Necromancer\u2019s Moon', 'Reign of Fire \u2013 OpenMW Edition', 'Engineers Guild \u2014 Chapter 1')) {
+            if (!$test.Contains($required)) { throw "Missing Unicode regression marker: $required" }
+          }
+          $patchedHash = (Get-FileHash mwgc-src/src/logic/SolidAssets.cpp -Algorithm SHA256).Hash.ToLower()
+          Write-Host "Patched SolidAssets.cpp SHA256: $patchedHash"
+
+      - uses: lukka/get-cmake@latest
+
+      - name: Install pinned current vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgCommit = "5cad485d1ddb649c8fa1022bf0b3908555e6e6ba"
+          git init vcpkg-current
+          git -C vcpkg-current remote add origin https://github.com/microsoft/vcpkg.git
+          git -C vcpkg-current fetch --depth=1 origin $vcpkgCommit
+          if ($LASTEXITCODE -ne 0) { throw "Unable to fetch pinned vcpkg revision" }
+          git -C vcpkg-current checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Unable to check out pinned vcpkg revision" }
+          $actual = (git -C vcpkg-current rev-parse HEAD).Trim()
+          if ($actual -ne $vcpkgCommit) { throw "Unexpected vcpkg revision: $actual" }
+          & .\vcpkg-current\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap failed" }
+          $root = (Resolve-Path vcpkg-current).Path
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Pinned vcpkg revision: $actual"
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg-current/downloads
+            vcpkg-current/packages
+            build/vcpkg_installed
+          key: mwgc-0611-${{ runner.os }}-vcpkg-5cad485d-${{ hashFiles('mwgc-src/vcpkg.json') }}
+
+      - name: Configure
+        shell: pwsh
+        env:
+          VCPKG_BINARY_SOURCES: clear
+        run: |
+          $toolchain = Join-Path $env:VCPKG_ROOT "scripts/buildsystems/vcpkg.cmake"
+          $args = @(
+            "-S", "mwgc-src",
+            "-B", "build",
+            "-A", "x64",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-static"
+          )
+          & cmake @args
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+
+      - name: Build Windows GUI, CLI and tests
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target MWGroundcoverGenerator MWGroundcoverGeneratorCLI MWGroundcoverGeneratorTests --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw "Windows build failed" }
+
+      - name: Run solid-clearance regression suites
+        shell: pwsh
+        run: |
+          $tests = "build/Release/MWGroundcoverGeneratorTests.exe"
+          if (!(Test-Path $tests)) { throw "Test executable missing" }
+          & $tests --run_test=solid_assets --log_level=test_suite --report_level=detailed
+          if ($LASTEXITCODE -ne 0) { throw "Solid-assets regression suite failed" }
+          & $tests --run_test=solid_geometry --log_level=test_suite --report_level=detailed
+          if ($LASTEXITCODE -ne 0) { throw "Solid-geometry regression suite failed" }
+
+      - name: Verify binaries
+        shell: pwsh
+        run: |
+          $gui = "build/Release/MWGroundcoverGenerator.exe"
+          $cli = "build/Release/MWGroundcoverGeneratorCLI.exe"
+          if (!(Test-Path $gui)) { throw "GUI executable missing" }
+          if (!(Test-Path $cli)) { throw "CLI executable missing" }
+          Get-Item $gui, $cli | Format-List Name,Length
+          Get-FileHash $gui -Algorithm SHA256
+          Get-FileHash $cli -Algorithm SHA256
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item build/Release/MWGroundcoverGenerator.exe artifact/
+          Copy-Item build/Release/MWGroundcoverGeneratorCLI.exe artifact/
+          Copy-Item mwgc-src/CHANGELOG.md artifact/
+          tar -cJf artifact/MWGroundcoverGenerator-0.6.11-Source.tar.xz -C mwgc-src .
+          if ($LASTEXITCODE -ne 0) { throw "Unable to package matching patched source" }
+          Get-FileHash artifact/MWGroundcoverGenerator.exe -Algorithm SHA256 | Out-File artifact/SHA256SUMS.txt -Encoding utf8
+          Get-FileHash artifact/MWGroundcoverGeneratorCLI.exe -Algorithm SHA256 | Out-File artifact/SHA256SUMS.txt -Encoding utf8 -Append
+          Get-FileHash artifact/MWGroundcoverGenerator-0.6.11-Source.tar.xz -Algorithm SHA256 | Out-File artifact/SHA256SUMS.txt -Encoding utf8 -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MWGroundcoverGenerator-0.6.11-Windows-x64
+          path: artifact
+          if-no-files-found: error
