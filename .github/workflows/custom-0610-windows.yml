@@ -46,37 +46,61 @@ jobs:
           tar -xJf mwgc0610-minsrc9.tar.xz -C mwgc-src
           if (!(Test-Path mwgc-src/CMakeLists.txt)) { throw "CMakeLists.txt missing after extraction" }
 
-          # Keep the source archive pristine; only omit tests from this build copy.
           $cmake = Get-Content -Raw mwgc-src/CMakeLists.txt
           $cmake = $cmake.Replace("add_subdirectory(tst)", "")
           [IO.File]::WriteAllText((Join-Path $PWD "mwgc-src/CMakeLists.txt"), $cmake)
 
+      - uses: lukka/get-cmake@latest
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        id: vcpkg
+        with:
+          runVcpkgInstall: false
+
       - name: Configure
         shell: pwsh
         run: |
-          $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT "scripts/buildsystems/vcpkg.cmake"
-          cmake -S mwgc-src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows-static -DVCPKG_INSTALL_OPTIONS="--clean-after-build"
+          $toolchain = Join-Path "${{ steps.vcpkg.outputs.RUNVCPKG_VCPKG_ROOT_OUT }}" "scripts/buildsystems/vcpkg.cmake"
+          $args = @(
+            "-S", "mwgc-src",
+            "-B", "build",
+            "-A", "x64",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-static"
+          )
+          $ok = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Configure attempt $attempt of 3"
+            & cmake @args
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
+          }
+          if (!$ok) { throw "CMake configure failed after 3 attempts" }
 
       - name: Build
         shell: pwsh
         run: |
-          cmake --build build --config Release --target MWGroundcoverGenerator MWGroundcoverGeneratorCLI
+          cmake --build build --config Release --target MWGroundcoverGenerator MWGroundcoverGeneratorCLI --parallel 2
 
       - name: Verify binaries
         shell: pwsh
         run: |
-          if (!(Test-Path build/MWGroundcoverGenerator.exe)) { throw "GUI executable missing" }
-          if (!(Test-Path build/MWGroundcoverGeneratorCLI.exe)) { throw "CLI executable missing" }
-          Get-Item build/MWGroundcoverGenerator.exe, build/MWGroundcoverGeneratorCLI.exe | Format-List Name,Length
-          Get-FileHash build/MWGroundcoverGenerator.exe -Algorithm SHA256
-          Get-FileHash build/MWGroundcoverGeneratorCLI.exe -Algorithm SHA256
+          $gui = "build/Release/MWGroundcoverGenerator.exe"
+          $cli = "build/Release/MWGroundcoverGeneratorCLI.exe"
+          if (!(Test-Path $gui)) { throw "GUI executable missing" }
+          if (!(Test-Path $cli)) { throw "CLI executable missing" }
+          Get-Item $gui, $cli | Format-List Name,Length
+          Get-FileHash $gui -Algorithm SHA256
+          Get-FileHash $cli -Algorithm SHA256
 
       - name: Stage artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifact | Out-Null
-          Copy-Item build/MWGroundcoverGenerator.exe artifact/
-          Copy-Item build/MWGroundcoverGeneratorCLI.exe artifact/
+          Copy-Item build/Release/MWGroundcoverGenerator.exe artifact/
+          Copy-Item build/Release/MWGroundcoverGeneratorCLI.exe artifact/
           Copy-Item mwgc0610-minsrc9.tar.xz artifact/MWGroundcoverGenerator-0.6.10-Source.tar.xz
 
       - uses: actions/upload-artifact@v4
