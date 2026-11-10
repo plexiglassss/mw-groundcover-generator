@@ -60,20 +60,19 @@ jobs:
         with:
           runVcpkgInstall: false
 
-      - name: Locate runner pkg-config
+      - name: Install pkg-config
         shell: pwsh
         run: |
-          $candidates = @(
-            "C:\\msys64\\usr\\bin\\pkg-config.exe",
-            "C:\\msys64\\mingw64\\bin\\pkg-config.exe",
-            "C:\\msys64\\ucrt64\\bin\\pkg-config.exe"
-          )
-          $pkg = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (!$pkg) {
-            $cmd = Get-Command pkg-config.exe -ErrorAction SilentlyContinue
-            if ($cmd) { $pkg = $cmd.Source }
+          choco install pkgconfiglite --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "Chocolatey pkgconfiglite install failed" }
+          $cmd = Get-Command pkg-config.exe -ErrorAction SilentlyContinue
+          if (!$cmd) {
+            $candidate = "C:\\ProgramData\\chocolatey\\bin\\pkg-config.exe"
+            if (Test-Path $candidate) { $pkg = $candidate }
+          } else {
+            $pkg = $cmd.Source
           }
-          if (!$pkg) { throw "No usable pkg-config.exe found on Windows runner" }
+          if (!$pkg) { throw "pkg-config.exe not found after pkgconfiglite install" }
           Write-Host "Using pkg-config: $pkg"
           "PKG_CONFIG=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
