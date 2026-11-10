@@ -46,6 +46,20 @@ jobs:
           tar -xJf mwgc0610-minsrc9.tar.xz -C mwgc-src
           if (!(Test-Path mwgc-src/CMakeLists.txt)) { throw "CMakeLists.txt missing after extraction" }
 
+          # fmt 12 no longer exposes fmt::format from <fmt/core.h>.
+          # Keep the 0.6.10 source compatible with both the current vcpkg port
+          # and the older fmt versions used by earlier local builds.
+          $fmtFiles = @(
+            "mwgc-src/src/esp/EspReader.h",
+            "mwgc-src/src/esp/EspReader.cpp",
+            "mwgc-src/src/esp/MutableEsp.h"
+          )
+          foreach ($file in $fmtFiles) {
+            $text = Get-Content -Raw $file
+            $text = $text.Replace("#include <fmt/core.h>", "#include <fmt/format.h>")
+            [IO.File]::WriteAllText((Join-Path $PWD $file), $text)
+          }
+
           $cmake = Get-Content -Raw mwgc-src/CMakeLists.txt
           $cmake = $cmake.Replace("add_subdirectory(tst)", "")
           [IO.File]::WriteAllText((Join-Path $PWD "mwgc-src/CMakeLists.txt"), $cmake)
@@ -69,6 +83,15 @@ jobs:
           $root = (Resolve-Path vcpkg-current).Path
           "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Pinned vcpkg revision: $actual"
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg-current/downloads
+            vcpkg-current/packages
+            build/vcpkg_installed
+          key: mwgc-0610-${{ runner.os }}-vcpkg-5cad485d-${{ hashFiles('mwgc-src/vcpkg.json') }}
 
       - name: Configure
         shell: pwsh
@@ -110,7 +133,8 @@ jobs:
           New-Item -ItemType Directory -Force artifact | Out-Null
           Copy-Item build/Release/MWGroundcoverGenerator.exe artifact/
           Copy-Item build/Release/MWGroundcoverGeneratorCLI.exe artifact/
-          Copy-Item mwgc0610-minsrc9.tar.xz artifact/MWGroundcoverGenerator-0.6.10-Source.tar.xz
+          tar -cJf artifact/MWGroundcoverGenerator-0.6.10-Source.tar.xz -C mwgc-src .
+          if ($LASTEXITCODE -ne 0) { throw "Unable to package matching patched source" }
 
       - uses: actions/upload-artifact@v4
         with:
