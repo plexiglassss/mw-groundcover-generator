@@ -1,0 +1,164 @@
+name: Custom 0.6.11 cached Windows build
+
+on:
+  push:
+    branches:
+      - custom-0.6.10
+    paths:
+      - ".github/workflows/custom-0611-cached-windows.yml"
+      - ".mwgc-ci/0611/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct exact 0.6.10 base source
+        shell: pwsh
+        run: |
+          $names = @(
+            ".mwgc-ci/source.part00",
+            ".mwgc-ci/source.part01a",
+            ".mwgc-ci/source.part02",
+            ".mwgc-ci/source.part03a",
+            ".mwgc-ci/source.part03b",
+            ".mwgc-ci/source.part04",
+            ".mwgc-ci/source.part05",
+            ".mwgc-ci/source.part06"
+          )
+          $b64 = ""
+          foreach ($name in $names) {
+            if (!(Test-Path $name)) { throw "Missing source block: $name" }
+            $b64 += (Get-Content -Raw $name).Trim()
+          }
+          if ($b64.Length -ne 103196) { throw "Unexpected Base64 length: $($b64.Length)" }
+          [IO.File]::WriteAllBytes("mwgc0610-base.tar.xz", [Convert]::FromBase64String($b64))
+          $hash = (Get-FileHash "mwgc0610-base.tar.xz" -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "f5466130cb51d91495e8f3a47342f2c3968d7e913155ec0746a1d4b6f13e4dfb") {
+            throw "Base source SHA256 mismatch: $hash"
+          }
+          New-Item -ItemType Directory -Force mwgc-src | Out-Null
+          tar -xJf mwgc0610-base.tar.xz -C mwgc-src
+          if (!(Test-Path mwgc-src/CMakeLists.txt)) { throw "CMakeLists.txt missing after extraction" }
+
+      - name: Apply and verify 0.6.11 Unicode-path fix
+        shell: pwsh
+        run: |
+          python .mwgc-ci/0611/apply_unicode_fix.py mwgc-src
+          if ($LASTEXITCODE -ne 0) { throw "0.6.11 source transformation failed" }
+
+          $fmtFiles = @(
+            "mwgc-src/src/esp/EspReader.h",
+            "mwgc-src/src/esp/EspReader.cpp",
+            "mwgc-src/src/esp/MutableEsp.h"
+          )
+          foreach ($file in $fmtFiles) {
+            $text = Get-Content -Raw $file
+            $text = $text.Replace("#include <fmt/core.h>", "#include <fmt/format.h>")
+            [IO.File]::WriteAllText((Join-Path $PWD $file), $text)
+          }
+
+          Copy-Item .mwgc-ci/0611/UnicodePathRegression.cpp mwgc-src/UnicodePathRegression.cpp
+          $cmake = Get-Content -Raw mwgc-src/CMakeLists.txt
+          $cmake = $cmake.Replace("add_subdirectory(tst)", "")
+          $testLines = @(
+            "",
+            "add_executable(MWGroundcoverUnicodePathTest",
+            "        UnicodePathRegression.cpp",
+            "        src/logic/SolidAssets.cpp",
+            "        src/logic/SolidGeometry.cpp",
+            "        src/logic/GameConfiguration.cpp)",
+            "target_compile_features(MWGroundcoverUnicodePathTest PRIVATE cxx_std_20)",
+            "target_link_libraries(MWGroundcoverUnicodePathTest spdlog::spdlog_header_only)",
+            ""
+          )
+          $cmake += ($testLines -join [Environment]::NewLine)
+          [IO.File]::WriteAllText((Join-Path $PWD "mwgc-src/CMakeLists.txt"), $cmake)
+
+          $cmakeCheck = Get-Content -Raw mwgc-src/CMakeLists.txt
+          if ($cmakeCheck -notmatch 'VERSION 0\.6\.11') { throw "Version was not updated to 0.6.11" }
+          if ($cmakeCheck -match 'add_subdirectory\(tst\)') { throw "Stale missing tst directory reference remains" }
+          if ($cmakeCheck -notmatch 'MWGroundcoverUnicodePathTest') { throw "Unicode regression target missing" }
+          $patchedHash = (Get-FileHash mwgc-src/src/logic/SolidAssets.cpp -Algorithm SHA256).Hash.ToLower()
+          Write-Host "Patched SolidAssets.cpp SHA256: $patchedHash"
+          if ($patchedHash -ne "4e6a8bfd1223ccee43c923e751e7782b39905b7e84f7a172fca75e9a10928c01") {
+            throw "Unexpected patched SolidAssets.cpp hash: $patchedHash"
+          }
+
+      - uses: lukka/get-cmake@latest
+
+      - name: Install pinned current vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgCommit = "5cad485d1ddb649c8fa1022bf0b3908555e6e6ba"
+          git init vcpkg-current
+          git -C vcpkg-current remote add origin https://github.com/microsoft/vcpkg.git
+          git -C vcpkg-current fetch --depth=1 origin $vcpkgCommit
+          if ($LASTEXITCODE -ne 0) { throw "Unable to fetch pinned vcpkg revision" }
+          git -C vcpkg-current checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Unable to check out pinned vcpkg revision" }
+          $actual = (git -C vcpkg-current rev-parse HEAD).Trim()
+          if ($actual -ne $vcpkgCommit) { throw "Unexpected vcpkg revision: $actual" }
+          & .\vcpkg-current\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap failed" }
+          $root = (Resolve-Path vcpkg-current).Path
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore 0.6.10-compatible dependency cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg-current/downloads
+            vcpkg-current/packages
+            build/vcpkg_installed
+          key: mwgc-0610-${{ runner.os }}-vcpkg-5cad485d-${{ hashFiles('mwgc-src/vcpkg.json') }}
+
+      - name: Configure
+        shell: pwsh
+        env:
+          VCPKG_BINARY_SOURCES: clear
+        run: |
+          $toolchain = Join-Path $env:VCPKG_ROOT "scripts/buildsystems/vcpkg.cmake"
+          cmake -S mwgc-src -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows-static
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+
+      - name: Build Windows GUI, CLI and Unicode regression
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target MWGroundcoverGenerator MWGroundcoverGeneratorCLI MWGroundcoverUnicodePathTest --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw "Windows build failed" }
+
+      - name: Run Unicode path regression
+        shell: pwsh
+        run: |
+          $test = "build/Release/MWGroundcoverUnicodePathTest.exe"
+          if (!(Test-Path $test)) { throw "Unicode regression executable missing" }
+          & $test
+          if ($LASTEXITCODE -ne 0) { throw "Unicode OpenMW path regression failed" }
+
+      - name: Verify and stage artifacts
+        shell: pwsh
+        run: |
+          $gui = "build/Release/MWGroundcoverGenerator.exe"
+          $cli = "build/Release/MWGroundcoverGeneratorCLI.exe"
+          if (!(Test-Path $gui)) { throw "GUI executable missing" }
+          if (!(Test-Path $cli)) { throw "CLI executable missing" }
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item $gui artifact/
+          Copy-Item $cli artifact/
+          tar -cJf artifact/MWGroundcoverGenerator-0.6.11-Source.tar.xz -C mwgc-src .
+          if ($LASTEXITCODE -ne 0) { throw "Unable to package matching source" }
+          Get-FileHash artifact/MWGroundcoverGenerator.exe -Algorithm SHA256 | Out-File artifact/SHA256SUMS.txt -Encoding utf8
+          Get-FileHash artifact/MWGroundcoverGeneratorCLI.exe -Algorithm SHA256 | Out-File artifact/SHA256SUMS.txt -Encoding utf8 -Append
+          Get-FileHash artifact/MWGroundcoverGenerator-0.6.11-Source.tar.xz -Algorithm SHA256 | Out-File artifact/SHA256SUMS.txt -Encoding utf8 -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MWGroundcoverGenerator-0.6.11-Windows-x64
+          path: artifact
+          if-no-files-found: error
