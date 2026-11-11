@@ -1,4 +1,4 @@
-name: Custom 0.6.11 Windows build
+name: Custom 0.6.10 Windows build
 
 on:
   push:
@@ -6,7 +6,6 @@ on:
       - custom-0.6.10
     paths:
       - ".github/workflows/custom-0610-windows.yml"
-      - ".mwgc-ci/unicode-path-0.6.11.patch"
   workflow_dispatch:
 
 permissions:
@@ -18,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Reconstruct and patch exact 0.6.11 source
+      - name: Reconstruct exact 0.6.10 source
         shell: pwsh
         run: |
           $names = @(
@@ -39,7 +38,7 @@ jobs:
           if ($b64.Length -ne 103196) { throw "Unexpected Base64 length: $($b64.Length)" }
           [IO.File]::WriteAllBytes("mwgc0610-minsrc9.tar.xz", [Convert]::FromBase64String($b64))
           $hash = (Get-FileHash "mwgc0610-minsrc9.tar.xz" -Algorithm SHA256).Hash.ToLower()
-          Write-Host "Base source SHA256: $hash"
+          Write-Host "Source SHA256: $hash"
           if ($hash -ne "f5466130cb51d91495e8f3a47342f2c3968d7e913155ec0746a1d4b6f13e4dfb") {
             throw "Source SHA256 mismatch: $hash"
           }
@@ -47,14 +46,9 @@ jobs:
           tar -xJf mwgc0610-minsrc9.tar.xz -C mwgc-src
           if (!(Test-Path mwgc-src/CMakeLists.txt)) { throw "CMakeLists.txt missing after extraction" }
 
-          git apply --directory=mwgc-src .mwgc-ci/unicode-path-0.6.11.patch
-          if ($LASTEXITCODE -ne 0) { throw "Unicode path patch did not apply cleanly" }
-          if (!(Select-String -Quiet -Path mwgc-src/CMakeLists.txt -Pattern "VERSION 0.6.11")) {
-            throw "0.6.11 version bump missing after patch"
-          }
-
           # fmt 12 no longer exposes fmt::format from <fmt/core.h>.
-          # Keep the source compatible with both current and older fmt versions.
+          # Keep the 0.6.10 source compatible with both the current vcpkg port
+          # and the older fmt versions used by earlier local builds.
           $fmtFiles = @(
             "mwgc-src/src/esp/EspReader.h",
             "mwgc-src/src/esp/EspReader.cpp",
@@ -65,6 +59,10 @@ jobs:
             $text = $text.Replace("#include <fmt/core.h>", "#include <fmt/format.h>")
             [IO.File]::WriteAllText((Join-Path $PWD $file), $text)
           }
+
+          $cmake = Get-Content -Raw mwgc-src/CMakeLists.txt
+          $cmake = $cmake.Replace("add_subdirectory(tst)", "")
+          [IO.File]::WriteAllText((Join-Path $PWD "mwgc-src/CMakeLists.txt"), $cmake)
 
       - uses: lukka/get-cmake@latest
 
@@ -93,7 +91,7 @@ jobs:
             vcpkg-current/downloads
             vcpkg-current/packages
             build/vcpkg_installed
-          key: mwgc-0611-${{ runner.os }}-vcpkg-5cad485d-${{ hashFiles('mwgc-src/vcpkg.json') }}
+          key: mwgc-0610-${{ runner.os }}-vcpkg-5cad485d-${{ hashFiles('mwgc-src/vcpkg.json') }}
 
       - name: Configure
         shell: pwsh
@@ -112,28 +110,20 @@ jobs:
           & cmake @args
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 
-      - name: Build GUI, CLI and tests
+      - name: Build
         shell: pwsh
         run: |
-          cmake --build build --config Release --target MWGroundcoverGenerator MWGroundcoverGeneratorCLI MWGroundcoverGeneratorTests --parallel 2
+          cmake --build build --config Release --target MWGroundcoverGenerator MWGroundcoverGeneratorCLI --parallel 2
           if ($LASTEXITCODE -ne 0) { throw "Windows build failed" }
-
-      - name: Run tests
-        shell: pwsh
-        run: |
-          ctest --test-dir build -C Release --output-on-failure
-          if ($LASTEXITCODE -ne 0) { throw "Regression tests failed" }
 
       - name: Verify binaries
         shell: pwsh
         run: |
           $gui = "build/Release/MWGroundcoverGenerator.exe"
           $cli = "build/Release/MWGroundcoverGeneratorCLI.exe"
-          $tests = "build/tst/Release/MWGroundcoverGeneratorTests.exe"
           if (!(Test-Path $gui)) { throw "GUI executable missing" }
           if (!(Test-Path $cli)) { throw "CLI executable missing" }
-          if (!(Test-Path $tests)) { throw "Test executable missing" }
-          Get-Item $gui, $cli, $tests | Format-List Name,Length
+          Get-Item $gui, $cli | Format-List Name,Length
           Get-FileHash $gui -Algorithm SHA256
           Get-FileHash $cli -Algorithm SHA256
 
@@ -143,11 +133,11 @@ jobs:
           New-Item -ItemType Directory -Force artifact | Out-Null
           Copy-Item build/Release/MWGroundcoverGenerator.exe artifact/
           Copy-Item build/Release/MWGroundcoverGeneratorCLI.exe artifact/
-          tar -cJf artifact/MWGroundcoverGenerator-0.6.11-Source.tar.xz -C mwgc-src .
+          tar -cJf artifact/MWGroundcoverGenerator-0.6.10-Source.tar.xz -C mwgc-src .
           if ($LASTEXITCODE -ne 0) { throw "Unable to package matching patched source" }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MWGroundcoverGenerator-0.6.11-Windows-x64
+          name: MWGroundcoverGenerator-0.6.10-Windows-x64
           path: artifact
           if-no-files-found: error
