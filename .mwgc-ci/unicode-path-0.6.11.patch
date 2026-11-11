@@ -1,0 +1,255 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(MW_GROUNDCOVER_GENERATOR VERSION 0.6.10)
++project(MW_GROUNDCOVER_GENERATOR VERSION 0.6.11)
+ 
+ set(Boost_USE_STATIC_LIBS ON)
+ set(wxWidgets_USE_STATIC ON)
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,9 @@
++## 0.6.11
++
++- Fixed Windows generation failure `No mapping for the Unicode character exists in the target multi-byte code page` while indexing OpenMW data directories.
++- OpenMW `data=` paths are now decoded as UTF-8 and all solid-clearance filesystem paths are logged/stored as UTF-8 instead of using the active ANSI code page.
++- Added regression coverage for non-Latin data-directory and mesh-directory names.
++
+ # Changelog
+ 
+ ## 0.6.10 - 2026-11-09
+--- a/src/logic/SolidAssets.cpp
++++ b/src/logic/SolidAssets.cpp
+@@ -32,6 +32,22 @@
+     return s.substr(first, s.find_last_not_of(" \t\r\n") - first + 1);
+ }
+ 
++// OpenMW configuration files are UTF-8. Never route filesystem paths through
++// the active Windows ANSI code page: std::filesystem::path::string() can throw
++// when a mod directory or resource filename contains characters outside it.
++std::string pathUtf8(const fs::path& path) {
++#if defined(__cpp_char8_t)
++    const auto value = path.generic_u8string();
++    return std::string(reinterpret_cast<const char*>(value.data()), value.size());
++#else
++    return path.generic_u8string();
++#endif
++}
++
++fs::path pathFromUtf8(const std::string& value) {
++    return fs::u8path(value);
++}
++
+ // Resource names are relative to a data directory, never filesystem paths.
+ std::optional<std::string> resourceName(std::string name, bool model) {
+     if (name.empty() || name.size() > 4096 || name.find('\0') != std::string::npos) return std::nullopt;
+@@ -72,7 +88,7 @@
+         throw std::runtime_error("Solid clearance cannot resolve the engine-specific OpenMW path token in "
+             + text + ". Use an explicit resource path in the selected configuration.");
+     if (text.find('\0') != std::string::npos) throw std::runtime_error("NUL in OpenMW resource path");
+-    fs::path path(text);
++    fs::path path = pathFromUtf8(text);
+     if (path.is_relative()) path = base / path;
+     // Preserve path spelling: OpenMW deduplicates loose directories by path
+     // value, and distinct symlink/../aliases can deliberately set precedence.
+@@ -93,14 +109,14 @@
+     if (!result.visited.insert(identity).second) return;
+     std::ifstream input(path);
+     if (!input || !fs::is_regular_file(path))
+-        throw std::runtime_error("Could not read OpenMW configuration for solid clearance: " + path.string());
++        throw std::runtime_error("Could not read OpenMW configuration for solid clearance: " + pathUtf8(path));
+     std::vector<std::pair<std::string, std::string>> entries;
+     std::set<std::string> replacements;
+     std::string line, section;
+     std::size_t lineNumber = 0;
+     while (std::getline(input, line)) {
+         if (++lineNumber > 1000000 || line.size() > 1024 * 1024)
+-            throw std::runtime_error("OpenMW resource configuration exceeds size limits: " + path.string());
++            throw std::runtime_error("OpenMW resource configuration exceeds size limits: " + pathUtf8(path));
+         if (lineNumber == 1 && line.rfind("\xef\xbb\xbf", 0) == 0) line.erase(0, 3);
+         line = trim(line);
+         if (line.empty() || line.front() == '#') continue;
+@@ -110,7 +126,7 @@
+         }
+         const auto equals = line.find('=');
+         if (equals == std::string::npos)
+-            throw std::runtime_error("Invalid OpenMW configuration line " + std::to_string(lineNumber) + " in " + path.string());
++            throw std::runtime_error("Invalid OpenMW configuration line " + std::to_string(lineNumber) + " in " + pathUtf8(path));
+         if (!section.empty()) continue;
+         auto key = trim(line.substr(0, equals));
+         auto value = trim(line.substr(equals + 1));
+@@ -121,7 +137,7 @@
+             entries.emplace_back(std::move(key), std::move(value));
+         }
+     }
+-    if (input.bad()) throw std::runtime_error("Failed reading OpenMW configuration: " + path.string());
++    if (input.bad()) throw std::runtime_error("Failed reading OpenMW configuration: " + pathUtf8(path));
+     if (replacements.contains("data")) result.data.clear();
+     if (replacements.contains("fallback-archive")) result.archives.clear();
+     if (replacements.contains("data-local")) result.localData.clear();
+@@ -152,16 +168,16 @@
+ std::vector<std::uint8_t> readBytes(const fs::path& path, std::uint64_t offset, std::uint64_t length,
+                                   std::uint64_t limit = maxModelBytes) {
+     if (length > limit || length > std::numeric_limits<std::size_t>::max())
+-        throw std::runtime_error("Resource exceeds the solid-clearance size limit: " + path.string());
++        throw std::runtime_error("Resource exceeds the solid-clearance size limit: " + pathUtf8(path));
+     const auto size = fs::file_size(path);
+     if (offset > size || length > size - offset || offset > std::uint64_t(std::numeric_limits<std::streamoff>::max()))
+-        throw std::runtime_error("Invalid resource byte range: " + path.string());
++        throw std::runtime_error("Invalid resource byte range: " + pathUtf8(path));
+     std::ifstream input(path, std::ios::binary);
+-    if (!input) throw std::runtime_error("Could not open resource: " + path.string());
++    if (!input) throw std::runtime_error("Could not open resource: " + pathUtf8(path));
+     input.seekg(static_cast<std::streamoff>(offset));
+     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
+     if (length && !input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(length)))
+-        throw std::runtime_error("Could not read complete resource: " + path.string());
++        throw std::runtime_error("Could not read complete resource: " + pathUtf8(path));
+     return bytes;
+ }
+ 
+@@ -191,10 +207,10 @@
+         std::error_code error;
+         if (fs::is_directory(path, error)) {
+             for (const auto& entry : fs::directory_iterator(path)) {
+-                if (index.size() > 1000000) throw std::runtime_error("Resource directory exceeds entry limit: " + path.string());
+-                const auto key = lower(entry.path().filename().string());
++                if (index.size() > 1000000) throw std::runtime_error("Resource directory exceeds entry limit: " + pathUtf8(path));
++                const auto key = lower(pathUtf8(entry.path().filename()));
+                 if (!index.emplace(key, entry.path()).second)
+-                    throw std::runtime_error("Ambiguous resource filenames differing only by case in " + path.string());
++                    throw std::runtime_error("Ambiguous resource filenames differing only by case in " + pathUtf8(path));
+             }
+         } else if (error) throw fs::filesystem_error("Could not inspect resource directory", path, error);
+         return directories.emplace(path, std::move(index)).first->second;
+@@ -226,13 +242,13 @@
+         const auto size = fs::file_size(path);
+         const auto header = readBytes(path, 0, 12);
+         if (u32(header.data()) != 0x100)
+-            throw std::runtime_error("Unsupported BSA format for solid clearance (classic Morrowind BSA required): " + path.string());
++            throw std::runtime_error("Unsupported BSA format for solid clearance (classic Morrowind BSA required): " + pathUtf8(path));
+         const std::uint64_t directorySize = u32(header.data() + 4);
+         const std::uint64_t count = u32(header.data() + 8);
+         if (count > 2000000 || directorySize > maxDirectoryBytes || directorySize < count * 12)
+-            throw std::runtime_error("Invalid BSA directory sizes: " + path.string());
++            throw std::runtime_error("Invalid BSA directory sizes: " + pathUtf8(path));
+         const auto dataStart = 12 + directorySize + count * 8;
+-        if (dataStart > size) throw std::runtime_error("Truncated BSA directory: " + path.string());
++        if (dataStart > size) throw std::runtime_error("Truncated BSA directory: " + pathUtf8(path));
+         const auto directoryBytes = readBytes(path, 12, directorySize, maxDirectoryBytes);
+         const auto nameStart = count * 12;
+         const auto nameSize = directorySize - nameStart;
+@@ -242,16 +258,16 @@
+             const std::uint64_t relative = u32(directoryBytes.data() + i * 8 + 4);
+             const std::uint64_t nameOffset = u32(directoryBytes.data() + count * 8 + i * 4);
+             if (nameOffset >= nameSize || relative > size - dataStart || length > size - dataStart - relative)
+-                throw std::runtime_error("Invalid BSA file entry: " + path.string());
++                throw std::runtime_error("Invalid BSA file entry: " + pathUtf8(path));
+             const auto start = directoryBytes.begin() + static_cast<std::ptrdiff_t>(nameStart + nameOffset);
+             const auto end = std::find(start, directoryBytes.end(), std::uint8_t(0));
+             if (end == directoryBytes.end() || end - start > 4096)
+-                throw std::runtime_error("Invalid BSA filename: " + path.string());
++                throw std::runtime_error("Invalid BSA filename: " + pathUtf8(path));
+             const auto name = resourceName(std::string(start, end), false);
+-            if (!name) throw std::runtime_error("Invalid relative BSA filename: " + path.string());
++            if (!name) throw std::runtime_error("Invalid relative BSA filename: " + pathUtf8(path));
+             if (name->rfind("meshes/", 0) != 0 || !name->ends_with(".nif")) continue;
+             if (!archiveNames.insert(*name).second)
+-                throw std::runtime_error("Ambiguous duplicate BSA model: " + *name + " in " + path.string());
++                throw std::runtime_error("Ambiguous duplicate BSA model: " + *name + " in " + pathUtf8(path));
+             // Archives are visited in configuration order; later archives win.
+             archives.insert_or_assign(*name, ArchiveEntry{path, dataStart + relative, length});
+         }
+@@ -281,10 +297,10 @@
+         } else {
+             if (error && error != std::errc::no_such_file_or_directory)
+                 throw fs::filesystem_error("Could not inspect OpenMW data directory", path, error);
+-            if (impl->logger) impl->logger->warn("Solid clearance: missing data directory skipped: {}", path.string());
++            if (impl->logger) impl->logger->warn("Solid clearance: missing data directory skipped: {}", pathUtf8(path));
+         }
+     }
+-    if (impl->data.empty()) throw std::runtime_error("No readable data directories in OpenMW configuration: " + impl->configuration.string());
++    if (impl->data.empty()) throw std::runtime_error("No readable data directories in OpenMW configuration: " + pathUtf8(impl->configuration));
+     for (std::size_t i = 0; i < config.archives.size(); ++i) {
+         if (impl->status) impl->status(static_cast<int>(100 * i / config.archives.size()),
+             "Indexing solid-clearance archive: " + config.archives[i]);
+@@ -293,7 +309,7 @@
+         impl->indexArchive(*archive);
+     }
+     if (impl->logger) impl->logger->info("Solid clearance resources: config={}, {} data directories, {} archives, {} archived models",
+-        impl->configuration.string(), impl->data.size(), impl->archiveCount, impl->archives.size());
++        pathUtf8(impl->configuration), impl->data.size(), impl->archiveCount, impl->archives.size());
+     if (impl->status) impl->status(100, "OpenMW resources ready for solid clearance");
+ }
+ 
+@@ -308,13 +324,13 @@
+         if (!normalized) throw std::runtime_error("Invalid relative NIF resource name");
+         std::vector<std::uint8_t> bytes;
+         if (const auto path = impl->findLoose(*normalized)) {
+-            impl->providers[key] = path->string();
++            impl->providers[key] = pathUtf8(*path);
+             bytes = readBytes(*path, 0, fs::file_size(*path));
+         } else {
+             const auto found = impl->archives.find(*normalized);
+             if (found == impl->archives.end()) throw std::runtime_error("Model not found in selected OpenMW resources");
+             const auto& entry = found->second;
+-            impl->providers[key] = entry.archive.string() + "::" + *normalized;
++            impl->providers[key] = pathUtf8(entry.archive) + "::" + *normalized;
+             bytes = readBytes(entry.archive, entry.offset, entry.size);
+         }
+         auto model = std::make_shared<SolidModel>(parseSolidModel(bytes));
+@@ -343,5 +359,5 @@
+ 
+ void SolidAssets::logSummary() const {
+     if (impl->logger) impl->logger->info("Solid clearance model summary: {} parsed, {} unavailable; config={}",
+-        impl->loaded, impl->failed, impl->configuration.string());
++        impl->loaded, impl->failed, pathUtf8(impl->configuration));
+ }
+--- a/tst/SolidAssetsTest.cpp
++++ b/tst/SolidAssetsTest.cpp
+@@ -8,7 +8,15 @@
+ 
+ namespace {
+ using namespace SolidTest;
+-std::string dataLine(const fs::path& path) { return "data=\"" + path.string() + "\"\n"; }
++std::string pathUtf8(const fs::path& path) {
++#if defined(__cpp_char8_t)
++    const auto value = path.generic_u8string();
++    return std::string(reinterpret_cast<const char*>(value.data()), value.size());
++#else
++    return path.generic_u8string();
++#endif
++}
++std::string dataLine(const fs::path& path) { return "data=\"" + pathUtf8(path) + "\"\n"; }
+ Bytes widthModel(float width) { return nif({box({-width,-1,0},{width,1,2})}); }
+ }
+ 
+@@ -123,4 +131,27 @@
+     BOOST_CHECK(assets.get("C:\\outside\\mesh.nif") == nullptr);
+ }
+ 
++BOOST_AUTO_TEST_CASE(UnicodePathsDoNotUseTheWindowsLegacyCodePage) {
++    Directory files;
++    const auto data = files.path / fs::u8path("\xE6\xA8\xB9\xE6\x9C\xA8-\xF0\x9F\x8C\xBF");
++    const auto meshDirectory = data / fs::u8path("meshes/\xE8\x8D\x89");
++    const auto mesh = meshDirectory / "block.nif";
++    fs::create_directories(mesh.parent_path());
++    const auto bytes = widthModel(17);
++    std::ofstream stream(mesh, std::ios::binary);
++    stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++    stream.close();
++    BOOST_REQUIRE(stream.good());
++
++    // An unrelated Unicode entry forces the directory index to enumerate a
++    // name that cannot be represented by many Windows legacy code pages.
++    fs::create_directories(data / fs::u8path("\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E-\xE2\x98\x83"));
++    const auto config = files.text("unicode-openmw.cfg", dataLine(data));
++    SolidAssets assets(config, makeNullLogger());
++    const auto model = assets.get("\xE8\x8D\x89/block.nif");
++    BOOST_REQUIRE(model != nullptr);
++    BOOST_CHECK_EQUAL(model->collisionBounds.max.x, 17.0f);
++    BOOST_CHECK(assets.providerFor("\xE8\x8D\x89/block.nif").find("\xE6\xA8\xB9\xE6\x9C\xA8") != std::string::npos);
++}
++
+ BOOST_AUTO_TEST_SUITE_END();
